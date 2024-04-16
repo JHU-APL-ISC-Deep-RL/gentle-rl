@@ -1,0 +1,62 @@
+{
+  "environment" : {
+    "type": "safety_gymnasium",
+    "name": "SafetyCarGoal2-v0",
+    "mod_config": {
+      "scale": 0.0,
+      "cost": "one_indicator"
+    }
+  },
+  "pi_network" : {
+      "sizes" : [256, 256],
+      "network_name" : "mlp_gaussian",
+      "discrete" : 0
+  },
+  "v_network" : {
+      "sizes" : [256, 256],
+      "network_name" : "mlp",
+      "discrete" : 0
+  },
+  "q_network" : {
+      "sizes" : [256, 256],
+      "network_name" : "mlp",
+      "discrete" : 0
+  },
+  "training_frames" : 10000000,
+  "max_ep_length" : 500,
+  "batch_size" : 10000,
+  "pi_lr" : 0.0001,
+  "v_lr" : 0.001,
+  "q_lr" : 0.0002,
+  "train_v_iter" : 10,
+  "train_q_iter" : 10,
+  "train_pi_iter" : 1,
+  "gamma" : 0.99,
+  "lam" : 0.97,
+  "clip" : -1,
+  "max_kl" : 0.012,
+  "q_batch_size" : 256,
+  "alpha" : 0.5,
+  "polyak" : 0.995,
+  "buffer_size" : 1000000,
+  "num_actions" : 100,
+  "num_cql" : 100,
+  "trpo" : true,
+  "cg_iter" : 10,
+  "cg_delta" : 0,
+  "damping_coeff" : 0.1,
+  "backtrack_iter" : 20,
+  "bactrack_coeff" : 0.7,
+  "full_kl" : true,
+  "bound_corr" : false,
+  "test_iteration" : -1,
+  "test_episodes" : 1000,
+  "checkpoint_every" : 1000000,
+  "evaluation_episodes" : -1,
+  "use_prior_nets" : false,
+  "cost_limit" : 25,
+  "penalty_init" : 0.025,
+  "penalty_lr" : 0.04,
+  "log_folder" : "../../logs/csc_debug",
+  "model_folder" : "../../output/csc_debug"
+}

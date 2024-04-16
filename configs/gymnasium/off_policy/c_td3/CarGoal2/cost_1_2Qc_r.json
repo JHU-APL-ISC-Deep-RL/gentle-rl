@@ -1,0 +1,51 @@
+{
+   "environment" : {
+     "type": "safety_gymnasium",
+     "name": "SafetyCarGoal2-v0",
+     "mod_config": {
+       "scale": 0.0,
+       "cost": "full"
+     }
+   },
+  "pi_network" : {
+    "sizes" : [256, 256],
+    "network_name" : "mlp_td3",
+    "discrete" : 0,
+    "activation" : "relu",
+    "output_activation" : "tanh"
+  },
+  "q_network" : {
+    "sizes" : [256, 256],
+    "network_name" : "mlp",
+    "discrete" : 0,
+    "activation" : "relu"
+  },
+  "two_qc" : true,
+  "beta_init" : 0.0025,
+  "lr_beta" : 0.000005,
+  "cost_limit" : 108,
+  "cost_type" : "c",
+  "cost_scale" : 0.1,
+  "beta_recency" : 10000,
+  "use_prior_nets" : 0,
+  "seed" : 0,
+  "total_steps" : 5000000,
+  "initial_random" : 10000,
+  "max_ep_length" : 500,
+  "start_learning" : 10000,
+  "update_every" : 1,
+  "updates_per_stop" : 1,
+  "gamma" : 0.99,
+  "buffer_size" : 1000000,
+  "epoch_size" : 10000,
+  "batch_size" : 256,
+  "polyak" : 0.995,
+  "lr" : 0.0001,
+  "reset_interval" : 200000,
+  "test_episodes" : 10,
+  "evaluation_ep" : 5,
+  "checkpoint_every" : 1000000,
+  "enable_restart" : false,
+  "log_folder" : "../../logs/gymnasium/off_policy/c_td3/CarGoal2/cost_1_2Qc_r",
+  "model_folder" : "../../output/gymnasium/off_policy/c_td3/CarGoal2/cost_1_2Qc_r"
+}

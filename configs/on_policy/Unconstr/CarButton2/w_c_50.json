@@ -1,0 +1,48 @@
+{
+  "environment" : {
+    "type" : "safety_gym",
+    "name" : "Safexp-CarButton2-v0",
+    "mod_config" : {
+      "scale" : 0.05,
+      "penalty" : "one_indicator"
+    }
+  },
+  "pi_network" : {
+    "sizes" : [256, 256],
+    "network_name" : "mlp_gaussian",
+    "discrete" : 0
+  },
+  "v_network" : {
+    "sizes" : [256, 256],
+    "network_name" : "mlp",
+    "discrete" : 0
+  },
+  "weight" : {
+    "type" : "wang",
+    "eta" : 0.5,
+    "num_trajectories" : 30
+  },
+  "metrics" : [{"type":  "wang_c", "eta":  0.5}],
+  "use_prior_nets" : 0,
+  "batch_size" : 30000,
+  "bound_corr" : true,
+  "max_ep_length" : 1000,
+  "reward_to_go" : 1,
+  "gae" : 1,
+  "surrogate" : 0,
+  "pi_lr" : 0.0003,
+  "v_lr" : 0.001,
+  "gamma" : 0.99,
+  "lambda" : 0.97,
+  "clip" : 0.2,
+  "v_clip" : -1,
+  "value_coeff" : 1,
+  "entropy_coeff" : 0.0,
+  "train_pi_iter" : 80,
+  "train_v_iter" : 80,
+  "max_kl" : 0.012,
+  "evaluation_every" : -1,
+  "training_frames" : 100000000,
+  "log_folder" : "../../logs/Unconstr/CarButton2/w_c_50",
+  "model_folder" : "../../output/Unconstr/CarButton2/w_c_50"
+}

@@ -1,0 +1,577 @@
+import sys
+import os
+import json
+import argparse
+import pickle
+import torch
+import gzip
+import numpy as np
+from pathlib import Path
+from box import Box
+from collections import OrderedDict
+from shutil import rmtree
+from copy import deepcopy
+from datetime import datetime
+from gentle.common.utils import get_env_object, get_network_object, get_sampler
+from gentle.common.loggers import Logger
+from gentle.common.buffers import OffPolicyBuffer
+from gentle.common.diagnostics import compute_model_norm, compute_model_grad_norm, get_model_params, compute_update_norm
+
+# CPU/GPU usage regulation.  One can assign more than one thread here, but it is probably best to use 1 in most cases.
+os.environ['OMP_NUM_THREADS'] = '1'
+torch.set_num_threads(1)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+class TD3(object):
+
+    def __init__(self, config):
+        self.config = config
+        self.process_config()
+        self.env, self.eval_env = None, None
+        self.pi_network, self.pi_target = None, None
+        self.pi_optimizer = None
+        self.q1_network, self.q1_target = None, None
+        self.q2_network, self.q2_target = None, None
+        self.q_optimizer = None
+        self.q_params = []
+        self.target_entropy = None
+        self.buffer = None
+        self.sampler = None
+        self.resets = 0
+        self.logger = None
+        self.network_updates = 0
+        t1 = int(10000 * (datetime.now().timestamp() - int(datetime.now().timestamp())))
+        torch.manual_seed((1 + self.config.seed) * 2000 + t1)
+        t2 = int(10000 * (datetime.now().timestamp() - int(datetime.now().timestamp())))
+        np.random.seed((1 + self.config.seed) * 5000 + t2)
+
+    def process_config(self):
+        """  Processes configuration, filling in missing values as appropriate  """
+        self.config.setdefault('use_prior_nets', False)  # whether to pick up where previous training left off
+        self.config.setdefault('seed', 0)
+        self.config.setdefault('total_steps', 1e6)  # total training steps
+        self.config.setdefault('initial_random', 10000)  # initial steps over which to take random actions
+        self.config.setdefault('max_ep_length', -1)  # default is to run until done
+        self.config.setdefault('start_learning', 1000)  # number of experience in initial data collection (no training)
+        self.config.setdefault('update_every', 1)  # how often to stop environment to update
+        self.config.setdefault('updates_per_stop', self.config.update_every)  # batches, updates per data collect stop
+        self.config.setdefault('gamma', 0.99)  # discount factor
+        self.config.setdefault('buffer_size', 1e6)  # capacity of replay buffer
+        self.config.setdefault('store_costs', False)  # whether to store costs individually in replay buffer
+        self.config.setdefault('epoch_size', 1e4)  # how often to run evaluation, log
+        self.config.setdefault('batch_size', 100)  # batch size sampled for each network update
+        self.config.setdefault('polyak', 0.995)  # weight of previous network weights in Polyak averaging
+        self.config.setdefault('lr', 0.001)  # learning rate for both Q and pi
+        # TD3
+        self.config.setdefault('policy_delay', 2)  # TD3 how often to update policy
+        self.config.setdefault('exploration_noise', 0.1)  # TD3 off-policy exploration noise std dev
+        self.config.setdefault('target_noise', 0.2)  # TD3 target policy smoothing noise std dev
+        self.config.setdefault('noise_clip', 0.5)  # TD3 target policy smoothing noise limit
+        # Evaluation / testing
+        self.config.setdefault('evaluation_ep', 5)  # how many episodes to run each evaluation
+        self.config.setdefault('evaluation_type', 'both')  # 'stoch', 'det', 'both', 'none'
+        self.config.setdefault('test_episodes', 1000)  # number of test episodes to run
+        # Recycling dormant neurons:
+        self.config.setdefault('redo_interval', -1)  # dormant neuron recycling interval (negative means to not recycle)
+        self.config.setdefault('redo_tau', 0.1)  # dormant neuron recycling threshold
+        self.config.setdefault('redo_batch_size', 256)  # dormant neuron recycling batch size
+        # Resetting to combat primacy bias
+        self.config.setdefault('reset_interval', -1)  # primacy bias reset interval (negative means to not reset)
+        if self.config.reset_interval < 0:
+            self.config.n_resets = 0
+        self.config.setdefault('n_resets', self.config.total_steps // self.config.reset_interval - 1)
+        assert self.config.redo_interval < 0 or self.config.reset_interval < 0, 'Cannot use both ReDo and resets'
+        # Logging and storage configurations:
+        self.config.setdefault('checkpoint_list', [])
+        self.config.setdefault('checkpoint_list_save_batch', True)
+        self.config.setdefault('checkpoint_list_save_buffer', True)
+        if isinstance(self.config.checkpoint_list, int):
+            self.config.checkpoint_list = ([self.config.start_learning] +
+                                           list(range(self.config.checkpoint_list, self.config.total_steps,
+                                                      self.config.checkpoint_list)))
+            self.config.checkpoint_list_save_buffer = False
+            self.config.checkpoint_list_save_batch = True
+        self.config.setdefault('checkpoint_every', int(1e5))
+        self.config.setdefault('enable_restart', True)  # save buffer, allowing training to restart
+        self.config.setdefault('model_folder', '../../output/td3_training')
+        self.config.setdefault('log_folder', '../../logs/td3_training')
+        self.config.model_folder = os.path.join(os.getcwd(), self.config.model_folder)
+        self.config.log_folder = os.path.join(os.getcwd(), self.config.log_folder)
+        self.config.model_folder = self.config.model_folder + '_' + str(self.config.seed)
+        self.config.log_folder = self.config.log_folder + '_' + str(self.config.seed)
+        if sys.platform[:3] == 'win':
+            self.config.model_folder = self.config.model_folder.replace('/', '\\')
+            self.config.log_folder = self.config.log_folder.replace('/', '\\')
+        if not self.config.use_prior_nets:  # start a fresh training run
+            if os.path.isdir(self.config.log_folder):
+                rmtree(self.config.log_folder, ignore_errors=True)
+            if os.path.isdir(self.config.model_folder):
+                rmtree(self.config.model_folder, ignore_errors=True)
+        Path(self.config.model_folder).mkdir(parents=True, exist_ok=True)
+        Path(self.config.log_folder).mkdir(parents=True, exist_ok=True)
+
+    def train(self):
+        self.initialize_env()
+        self.initialize_buffer()
+        steps, last_checkpoint = self.initialize_networks()
+        self.initialize_sampler()
+        self.initialize_optimizers()
+        obs, _ = self.reset_env(self.env)
+        self.initialize_logging(obs)
+        # Run training:
+        loss_info, data = {}, {}
+        while steps < self.config.total_steps:
+            random_action = steps < self.config.initial_random
+            action = self.get_action(obs, noise_scale=self.config.exploration_noise, random_action=random_action)
+            trunc = self.buffer.episode_lengths[-1] == self.config.max_ep_length - 1
+            next_obs, reward, terminated, truncated, info = self.step_env(self.env, action, trunc)
+            self.buffer.update(obs, action, reward, next_obs, np.float32(terminated), info)
+            steps += 1
+            obs = next_obs
+            if terminated or truncated:
+                self.buffer.reset_episode()
+                obs, _ = self.reset_env(self.env)
+            if steps >= self.config.start_learning and steps % self.config.update_every == 0:
+                for i in range(self.config.updates_per_stop):
+                    data, latest_loss_info = self.update_networks(steps)
+                    self.concatenate_dict_of_lists(loss_info, latest_loss_info)
+            if steps >= self.config.start_learning:
+                if (steps - self.config.start_learning) % self.config.epoch_size == 0:
+                    evaluation_stoch, evaluation_det = {}, {}
+                    if self.config.evaluation_type in ['stoch', 'both']:
+                        evaluation_stoch = self.run_evaluation(deterministic=False)
+                    if self.config.evaluation_type in ['det', 'both']:
+                        evaluation_det = self.run_evaluation(deterministic=True)
+                    self.update_logging(loss_info, evaluation_stoch, evaluation_det, steps)
+                    loss_info = {}
+                    last_checkpoint = self.save_training(steps, last_checkpoint, data)
+            # Recycle dormant neurons or reset to combat primacy bias (use at most one of these):
+            if steps // self.config.redo_interval > self.resets:
+                self.recycle_dormant()
+                self.resets += 1
+            if steps // self.config.reset_interval > self.resets:
+                self.reset_learning()
+                self.resets += 1
+
+    def initialize_env(self):
+        """  Initialize environment objects  """
+        self.env = get_env_object(self.config)
+        self.eval_env = get_env_object(self.config)
+
+    def initialize_buffer(self):
+        """  Initialize replay buffer  """
+        self.buffer = OffPolicyBuffer(capacity=self.config.buffer_size,
+                                      obs_dim=self.env.observation_space.shape[0],
+                                      act_dim=self.env.action_space.shape[0],
+                                      store_costs=self.config.store_costs)
+        if self.config.use_prior_nets:
+            self.buffer.load(os.path.join(self.config.model_folder, 'buffer-latest.p.tar.gz'))
+            self.buffer.episode_lengths = self.buffer.episode_lengths[:-1] + [0]
+            self.buffer.episode_rewards = self.buffer.episode_rewards[:-1] + [0]
+            if self.config.store_costs:
+                self.buffer.episode_costs = self.buffer.episode_costs[:-1] + [0]
+
+    def initialize_networks(self, reset=False):
+        """  Initialize network objects  """
+        total_steps, last_checkpoint = 0, -1
+        self.network_updates = 0
+        if not reset or self.resets < self.config.n_resets:
+            self.pi_network = get_network_object(self.config.pi_network).to(device)
+            self.pi_target = deepcopy(self.pi_network).to(device)
+            self.q1_network = get_network_object(self.config.q_network).to(device)
+            self.q2_network = get_network_object(self.config.q_network).to(device)
+            self.q1_target = deepcopy(self.q1_network).to(device)
+            self.q2_target = deepcopy(self.q2_network).to(device)
+            self.q_params = list(self.q1_network.parameters()) + list(self.q2_network.parameters())
+        if not reset:
+            if self.config.use_prior_nets:
+                checkpoint = torch.load(os.path.join(self.config.model_folder, 'model-latest.pt'),
+                                        map_location=torch.device('cpu'))
+                self.pi_network.load_state_dict(checkpoint.pi)
+                self.q1_network.load_state_dict(checkpoint.q1)
+                self.q2_network.load_state_dict(checkpoint.q2)
+                if 'q1_t' in checkpoint:
+                    self.q1_target.load_state_dict(checkpoint.q1_t)
+                    self.q2_target.load_state_dict(checkpoint.q2_t)
+                    self.pi_target.load_state_dict(checkpoint.pi_t)
+                total_steps = checkpoint.steps
+                last_checkpoint = total_steps // self.config.checkpoint_every
+        if self.q1_target is not None:
+            for p in torch.nn.ModuleList([self.q1_target, self.q2_target, self.pi_target]).parameters():
+                p.requires_grad = False
+        return total_steps, last_checkpoint
+
+    def initialize_sampler(self):
+        self.sampler = get_sampler(self.config.pi_network, action_space=self.env.action_space)
+
+    def initialize_optimizers(self, reset=False):
+        """  Initializes Adam optimizer for training network.  Only one worker actually updates parameters.  """
+        if not reset or self.resets < self.config.n_resets:
+            self.pi_optimizer = torch.optim.Adam(params=self.pi_network.parameters(), lr=self.config.lr)
+            q_params = torch.nn.ModuleList([self.q1_network, self.q2_network]).parameters()
+            self.q_optimizer = torch.optim.Adam(params=q_params, lr=self.config.lr)
+        if not reset:
+            if self.config.use_prior_nets:
+                checkpoint = torch.load(os.path.join(self.config.model_folder, 'model-latest.pt'))
+                self.pi_optimizer.load_state_dict(checkpoint.pi_opt)
+                self.q_optimizer.load_state_dict(checkpoint.q_opt)
+
+    def initialize_logging(self, obs):
+        """  Initialize logger and store config (only on one process)  """
+        self.logger = Logger(self.config.log_folder, device=device)
+        if not self.config.use_prior_nets:
+            with open(os.path.join(self.config.model_folder, 'config.pkl'), 'wb') as config_file:
+                pickle.dump(self.config, config_file)  # store configuration
+            self.logger.log_config(self.config)
+            self.logger.log_graph(obs, self.pi_network)
+            evaluation_stoch, evaluation_det = {}, {}
+            if self.config.evaluation_type in ['stoch', 'both']:
+                evaluation_stoch = self.run_evaluation(deterministic=False)
+            if self.config.evaluation_type in ['det', 'both']:
+                evaluation_det = self.run_evaluation(deterministic=True)
+            for k, v in evaluation_stoch.items():
+                if k == 'info':
+                    for k_info, v_info in v.items():
+                        self.logger.log_mean_value('Eval_stoch/Info/' + k_info, v_info, 0)
+                else:
+                    self.logger.log_mean_value('Eval_stoch/' + k, v, 0)
+            for k, v in evaluation_det.items():
+                if k == 'info':
+                    for k_info, v_info in v.items():
+                        self.logger.log_mean_value('Eval_det/Info/' + k_info, v_info, 0)
+                else:
+                    self.logger.log_mean_value('Eval_det/' + k, v, 0)
+            self.logger.flush()
+
+    def get_action(self, obs, noise_scale, random_action=False):
+        with torch.no_grad():
+            obs_torch = torch.from_numpy(obs).to(device).float()
+            pi = self.pi_network(obs_torch)
+            return self.sampler.get_action(pi, noise_scale=noise_scale, random=random_action).cpu().numpy()
+
+    def update_networks(self, steps):
+        """  Update all networks  """
+        self.network_updates += 1
+        data = self.buffer.sample(self.config.batch_size)
+        # Update Q networks:
+        old_q1_params = get_model_params(self.q1_network)
+        old_q2_params = get_model_params(self.q2_network)
+        q_loss, q_info = self.compute_q_loss(data)
+        self.q_optimizer.zero_grad()
+        q_loss.backward()
+        q_info['q1_gnorm'] = compute_model_grad_norm(self.q1_network).item()
+        q_info['q2_gnorm'] = compute_model_grad_norm(self.q2_network).item()
+        self.q_optimizer.step()
+        q_info['q1_unorm'] = compute_update_norm(old_q1_params, self.q1_network).item()
+        q_info['q2_unorm'] = compute_update_norm(old_q2_params, self.q2_network).item()
+
+        if self.network_updates % self.config.policy_delay == 0:
+            # Update policy network:
+            for p in self.q_params:
+                p.requires_grad = False  # fix Q parameters for policy update
+
+            old_pi_params = get_model_params(self.pi_network)
+            pi_loss, pi_info = self.compute_pi_loss(data)
+            self.pi_optimizer.zero_grad()
+            pi_loss.backward()
+            pi_info['pi_gnorm'] = compute_model_grad_norm(self.pi_network).item()
+            self.pi_optimizer.step()
+            pi_info['pi_unorm'] = compute_update_norm(old_pi_params, self.pi_network).item()
+
+            for p in self.q_params:
+                p.requires_grad = True  # allow Q parameters to vary again
+
+            # Update target networks:
+            self.update_targets()
+            return data, {**q_info, **pi_info}
+        else:
+            return data, q_info
+
+    def compute_q_loss(self, data):
+        """  Compute loss for Q update  """
+        q1 = self.q1_network(torch.cat((data.obs, data.actions), dim=-1)).squeeze(-1)
+        q2 = self.q2_network(torch.cat((data.obs, data.actions), dim=-1)).squeeze(-1)
+        with torch.no_grad():  # just computing targets
+            pi_target = self.pi_target(data.next_obs)
+
+            # Target policy smoothing
+            act_next = self.sampler.get_action(pi_target, noise_scale=self.config.target_noise,
+                                               noise_clip=self.config.noise_clip, clamp_action=True)
+
+            # Target Q-values
+            q1_target = self.q1_target(torch.cat((data.next_obs, act_next), dim=-1)).squeeze(-1)
+            q2_target = self.q2_target(torch.cat((data.next_obs, act_next), dim=-1)).squeeze(-1)
+            q_target = torch.min(q1_target, q2_target)
+            not_dones = (torch.ones_like(data.terminated, device=device) - data.terminated).squeeze(-1)
+            backup = data.rewards.squeeze(-1) + self.config.gamma * not_dones * q_target
+        q1_loss = ((q1 - backup) ** 2).mean()
+        q2_loss = ((q2 - backup) ** 2).mean()
+        q_info = {'q1': torch.mean(q1).item(), 'q2': torch.mean(q2).item(), 'q1_pnorm': compute_model_norm(self.q1_network).item(), 'q2_pnorm': compute_model_norm(self.q2_network).item()}
+        q_loss = q1_loss + q2_loss
+        return q_loss, q_info
+
+    def compute_pi_loss(self, data):
+        """  Compute loss for policy network  """
+        pi = self.pi_network(data.obs)
+        act = self.sampler.get_action(pi, noise_scale=0, clamp_action=False)
+        inputs = torch.cat((data.obs, act), dim=-1)
+        q1_pi = self.q1_network(inputs).squeeze(-1)
+        pi_loss = -q1_pi.mean()
+        pi_info = {'pi_loss': pi_loss.item(), 'pi_pnorm': compute_model_norm(self.pi_network)}
+        return pi_loss, pi_info
+
+    def update_targets(self):
+        """  Update target networks via Polyak averaging  """
+        with torch.no_grad():
+            for p, p_targ in zip(self.q1_network.parameters(), self.q1_target.parameters()):
+                p_targ.data.mul_(self.config.polyak)
+                p_targ.data.add_((1 - self.config.polyak) * p.data)
+            for p, p_targ in zip(self.q2_network.parameters(), self.q2_target.parameters()):
+                p_targ.data.mul_(self.config.polyak)
+                p_targ.data.add_((1 - self.config.polyak) * p.data)
+            for p, p_targ in zip(self.pi_network.parameters(), self.pi_target.parameters()):
+                p_targ.data.mul_(self.config.polyak)
+                p_targ.data.add_((1 - self.config.polyak) * p.data)
+
+    def run_evaluation(self, num_episodes=0, deterministic=False):
+        """  Run episodes with deterministic agent, in order to gauge progress  """
+        if num_episodes == 0:
+            num_episodes = self.config.evaluation_ep
+        if num_episodes > 0:
+            results = Box({'rewards': [], 'lengths': [], 'info': {}, 'q1': [], 'q2': [], 'q_min': [], 'q_true': [],
+                           'td_error1': [], 'td_error2': []})
+        else:
+            results = Box({})
+        for j in range(num_episodes):
+            obs, info = self.reset_env(self.eval_env)
+            terminated, truncated = False, False
+            ep_rew, ep_len, ep_q1, ep_q2, ep_q, ep_qt, ep_info = [], 0, [], [], 0, [], {}
+            self.concatenate_dict_of_lists(ep_info, info)
+            while not terminated and not truncated:
+                if deterministic:
+                    action = self.get_action(obs, noise_scale=0.0)
+                else:
+                    action = self.get_action(obs, noise_scale=self.config.exploration_noise)
+                with torch.no_grad():
+                    torch_obs = torch.from_numpy(obs).to(device).float()
+                    torch_act = torch.from_numpy(action).to(device).float()
+                    q1_pred = self.q1_network(torch.cat((torch_obs, torch_act), dim=-1)).item()
+                    q2_pred = self.q2_network(torch.cat((torch_obs, torch_act), dim=-1)).item()
+                    q1_targ = self.q1_target(torch.cat((torch_obs, torch_act), dim=-1)).item()
+                    q2_targ = self.q2_target(torch.cat((torch_obs, torch_act), dim=-1)).item()
+                    q_pred = min(q1_pred, q2_pred)
+                    q_targ = min(q1_targ, q2_targ)
+                trunc = ep_len == self.config.max_ep_length - 1
+                next_obs, reward, terminated, truncated, info = self.step_env(self.eval_env, action, trunc)
+                obs = next_obs
+                ep_rew += [reward]
+                ep_len += 1
+                ep_q1 += [q1_pred]
+                ep_q2 += [q2_pred]
+                ep_q += q_pred
+                ep_qt += [q_targ]
+                self.concatenate_dict_of_lists(ep_info, info)
+            results.rewards.append(sum(ep_rew))
+            results.lengths.append(ep_len)
+            for k, v in ep_info.items():
+                ep_info[k] = sum(v)
+            self.concatenate_dict_of_lists(results.info, ep_info)
+            results.q1.append(sum(ep_q1) / ep_len)
+            results.q2.append(sum(ep_q2) / ep_len)
+            results.q_min.append(ep_q / ep_len)
+            q_true = self.compute_q(ep_rew)
+            results.q_true.append(q_true)
+            td_error1 = self.compute_td_error(np.array(ep_rew), np.array(ep_q1), np.array(ep_qt))
+            td_error2 = self.compute_td_error(np.array(ep_rew), np.array(ep_q2), np.array(ep_qt))
+            results.td_error1.append(td_error1)
+            results.td_error2.append(td_error2)
+        return results
+
+    def compute_td_error(self, ep_reward, ep_q, ep_qt):
+        return np.sum((ep_reward[:-1] + self.config.gamma * ep_qt[1:] - ep_q[:-1]) ** 2) / ep_reward.shape[0]
+
+    def compute_q(self, ep_reward):
+        full_rewards = np.array(ep_reward)
+        t = len(ep_reward)
+        q = [ep_reward[i] + np.sum(self.config.gamma ** np.arange(1, t - i) * full_rewards[i + 1:]) for i in range(t)]
+        return sum(q) / t
+
+    def update_logging(self, loss_info, evaluation_stoch, evaluation_det, steps):
+        """  Update TensorBoard logging, reset buffer logging quantities  """
+        for k, v in loss_info.items():
+            self.logger.log_mean_value('Learning/' + k, v, steps)
+        for k, v in evaluation_stoch.items():
+            if k == 'info':
+                for k_info, v_info in v.items():
+                    self.logger.log_mean_value('Eval_stoch/Info/' + k_info, v_info, steps)
+            else:
+                self.logger.log_mean_value('Eval_stoch/' + k, v, steps)
+        for k, v in evaluation_det.items():
+            if k == 'info':
+                for k_info, v_info in v.items():
+                    self.logger.log_mean_value('Eval_det/Info/' + k_info, v_info, steps)
+            else:
+                self.logger.log_mean_value('Eval_det/' + k, v, steps)
+        self.logger.log_mean_value('Train/rewards', self.buffer.episode_rewards[:-1], steps)
+        self.logger.log_mean_value('Train/lengths', self.buffer.episode_lengths[:-1], steps)
+        self.buffer.reset_logging()
+        self.logger.flush()
+
+    def save_training(self, total_steps, last_checkpoint, data):
+        """  Save networks, as required.  Update last_checkpoint.  """
+        checkpoint_required = (total_steps in self.config.checkpoint_list or
+                               total_steps // self.config.checkpoint_every > last_checkpoint)
+        training = Box({})
+        if checkpoint_required:
+            training = Box({'pi': self.pi_network.state_dict(),
+                            'q1': self.q1_network.state_dict(),
+                            'q2': self.q2_network.state_dict(),
+                            'steps': total_steps})
+            if self.config.enable_restart:
+                training.q1_t = self.q1_target.state_dict()
+                training.q2_t = self.q2_target.state_dict()
+                training.pi_t = self.pi_target.state_dict()
+                training.pi_opt = self.pi_optimizer.state_dict()
+                training.q_opt = self.q_optimizer.state_dict()
+        if total_steps in self.config.checkpoint_list:
+            torch.save(training, os.path.join(self.config.model_folder, 'model-' + str(total_steps) + '.pt'))
+            if self.config.checkpoint_list_save_batch:
+                self.save_batch(data, os.path.join(self.config.model_folder, 'batch-' + str(total_steps) + '.p.tar.gz'))
+            if self.config.checkpoint_list_save_buffer:
+                self.buffer.save(os.path.join(self.config.model_folder, 'buffer-' + str(total_steps) + '.p.tar.gz'))
+        if total_steps // self.config.checkpoint_every > last_checkpoint:
+            torch.save(training, os.path.join(self.config.model_folder, 'model-latest.pt'))
+            last_checkpoint += 1
+            if self.config.enable_restart:  # save buffer
+                self.buffer.save(os.path.join(self.config.model_folder, 'buffer-latest.p.tar.gz'))
+        return last_checkpoint
+
+    def reset_learning(self):
+        """  Reset networks and optimizers to combat primacy bias  """
+        self.initialize_networks(reset=True)
+        self.initialize_optimizers(reset=True)
+
+    def test(self):
+        """  Test agent on a prescribed number of episodes  """
+        self.eval_env = get_env_object(self.config)
+        _, _ = self.initialize_networks()
+        self.sampler = get_sampler(self.config.pi_network)
+        results = self.run_evaluation(self.config.test_episodes)
+        with open(os.path.join(self.config.model_folder, 'test_output_nondeterministic.pkl'), 'wb') as output_file:
+            pickle.dump(results, output_file)
+
+    def recycle_dormant(self):
+        """  Recycle dormant neurons in policy, Q networks  """
+        data = self.buffer.sample(self.config.redo_batch_size)
+        pi_input = data.obs
+        q_input = torch.cat((data.obs, data.actions), dim=-1)
+        inputs = [pi_input, q_input, q_input]
+        configs = [self.config.pi_network, self.config.q_network, self.config.q_network]
+        models = [self.pi_network, self.q1_network, self.q2_network]
+        q2_param_start = len(self.q_optimizer.state_dict()['state'].keys()) / 2
+        optimizers = [(self.pi_optimizer, 0), (self.q_optimizer, 0), (self.q_optimizer, q2_param_start)]
+        for i, c, m, o in zip(inputs, configs, models, optimizers):
+            self.reset_neurons(i, c, m, o, self.config.redo_tau)
+
+    @staticmethod
+    def reset_neurons(data, config, model, optimizer, redo_tau):
+        """
+        Recycle dormant neurons in linear layers of a given network, as well as its corresponding optimizer.
+        Note that the PyTorch linear layer is given by y = xA^T + b, and that optimizer argument contains
+        starting point for relevant parameters because Q1, Q2 networks share an optimizer.
+        """
+        # Create network hooks:
+        activation = OrderedDict()
+
+        def get_activation(name):
+            def hook(model, data_in, layer_out):
+                activation[name] = layer_out.detach()
+
+            return hook
+
+        fresh_net = get_network_object(config).to(device)
+        hooks = []
+        for n, l in model.named_modules():
+            if isinstance(l, torch.nn.modules.linear.Linear):
+                handle = l.register_forward_hook(get_activation(n))
+                hooks.append(handle)
+        model(data)
+        # Compute normalized scores:
+        for k, v in activation.items():
+            activation[k] = torch.mean(torch.abs(v), dim=0) / (torch.mean(torch.abs(v)) + 1.e-9)
+        # Reset / zero network layers and optimizer where necessary:
+        layer, dormant = 0, None
+        optimizer, p0 = optimizer
+        for k in activation.keys():
+            if layer > 0:
+                model.state_dict()[k + '.weight'][:, dormant] = 0.
+                optimizer.state_dict()['state'][layer * 2]['exp_avg'][:, dormant] = 0.
+                optimizer.state_dict()['state'][layer * 2]['exp_avg_sq'][:, dormant] = 0.
+            dormant = torch.where(activation[k] <= redo_tau)[0]
+            model.state_dict()[k + '.weight'][dormant, :] = fresh_net.state_dict()[k + '.weight'][dormant, :]
+            model.state_dict()[k + '.bias'][dormant] = fresh_net.state_dict()[k + '.bias'][dormant]
+            optimizer.state_dict()['state'][layer * 2 + p0]['exp_avg'][dormant, :] = 0.
+            optimizer.state_dict()['state'][layer * 2 + p0]['exp_avg_sq'][dormant, :] = 0.
+            optimizer.state_dict()['state'][layer * 2 + 1 + p0]['exp_avg'][dormant] = 0.
+            optimizer.state_dict()['state'][layer * 2 + 1 + p0]['exp_avg_sq'][dormant] = 0.
+            layer += 1
+        [h.remove() for h in hooks]  # don't want hooks outside this method
+
+    @staticmethod
+    def step_env(env, action, truncated):
+        """ Steps input environment, accommodating Gym, Gymnasium APIs"""
+        step_output = env.step(action)
+        if len(step_output) == 4:  # gym
+            next_obs, reward, terminated, info = step_output
+        else:  # gymnasium
+            next_obs, reward, terminated, truncated, info = step_output
+        if truncated:
+            terminated = False
+        return next_obs, reward, terminated, truncated, info
+
+    @staticmethod
+    def reset_env(env):
+        """  Resets an environment, accommodating Gym, Gymnasium APIs """
+        outputs = env.reset()
+        if isinstance(outputs, tuple):
+            return outputs
+        else:
+            return outputs, {}
+
+    @staticmethod
+    def concatenate_dict_of_lists(base_dict, new_dict):
+        for k, v in new_dict.items():
+            if k not in base_dict:
+                base_dict[k] = [v]
+            else:
+                base_dict[k] += [v]
+
+    @staticmethod
+    def save_batch(data, filename):
+        """  Save a batch of training data  """
+        with gzip.open(filename, 'wb') as fp:
+            pickle.dump(data, fp)
+
+
+if __name__ == '__main__':
+    """  Runs TD3 training or testing for a given input configuration file  """
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', help='Configuration file to run', required=True)
+    parser.add_argument('--mode', default='train', required=False, help='mode ("train" or "test")')
+    parser.add_argument('--seed', help='random seed', required=False, type=int, default=0)
+    parser.add_argument('--prior', help='use prior training', required=False, type=int, default=0)
+    in_args = parser.parse_args()
+    full_config = os.path.join(os.getcwd(), in_args.config)
+    print(full_config)
+    sys.stdout.flush()
+    with open(full_config, 'r') as f1:
+        config1 = Box(json.load(f1))
+    config1.seed = in_args.seed
+    if in_args.prior > 0 or in_args.mode.lower() == 'test':
+        config1.use_prior_nets = True
+    td3_object = TD3(config1)
+    if in_args.mode.lower() == 'train':
+        td3_object.train()
+    else:
+        td3_object.test()

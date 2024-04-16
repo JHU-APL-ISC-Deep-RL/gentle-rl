@@ -1,0 +1,49 @@
+{
+   "environment" : {
+     "type" : "dm_control",
+     "name" : "cheetah-run"
+   },
+  "pi_network" : {
+    "sizes" : [256, 256],
+    "network_name" : "mlp_opac",
+    "sampler" : "tanh",
+    "discrete" : 0,
+    "log_std_net" : true,
+    "min_log_std" : -20,
+    "max_log_std" : 2
+  },
+  "q_network" : {
+    "sizes" : [256, 256],
+    "network_name" : "mlp",
+    "discrete" : 0
+  },
+  "v_network" : {
+    "sizes" : [256, 256],
+    "network_name" : "mlp",
+    "discrete" : 0
+  },
+  "use_prior_nets" : 0,
+  "seed" : 0,
+  "total_steps" : 5000000,
+  "initial_random" : 10000,
+  "max_ep_length" : 1000,
+  "start_learning" : 10000,
+  "update_every" : 1,
+  "updates_per_stop" : 1,
+  "entropy_type" : "max",
+  "alpha" : [1.0, true],
+  "gamma" : 0.99,
+  "buffer_size" : 1000000,
+  "epoch_size" : 10000,
+  "batch_size" : 256,
+  "polyak" : 0.995,
+  "lr" : 0.0001,
+  "reset_interval" : -1,
+  "test_episodes" : 10,
+  "evaluation_ep" : 1,
+  "evaluation_type" : "stoch",
+  "checkpoint_every" : 1000000,
+  "enable_restart" : false,
+  "log_folder" : "../../logs/dmc/opac/cheetah-run/run_1",
+  "model_folder" : "../../output/dmc/opac/cheetah-run/run_1"
+}

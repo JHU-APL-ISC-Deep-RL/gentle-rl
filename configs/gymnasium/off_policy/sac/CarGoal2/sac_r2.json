@@ -1,0 +1,47 @@
+{
+   "environment" : {
+     "type": "safety_gymnasium",
+     "name": "SafetyCarGoal2-v0",
+     "mod_config": {
+       "scale": 0.075,
+       "cost": "one_indicator"
+     }
+   },
+  "pi_network" : {
+    "sizes" : [256, 256],
+    "network_name" : "mlp_sac",
+    "discrete" : 0,
+    "log_std_net" : true,
+    "activation" : "relu",
+    "min_log_std" : -20,
+    "max_log_std" : 2
+  },
+  "q_network" : {
+    "sizes" : [256, 256],
+    "network_name" : "mlp",
+    "discrete" : 0,
+    "activation" : "relu"
+  },
+  "use_prior_nets" : 0,
+  "seed" : 0,
+  "total_steps" : 5000000,
+  "initial_random" : 10000,
+  "max_ep_length" : 500,
+  "start_learning" : 10000,
+  "update_every" : 1,
+  "updates_per_stop" : 1,
+  "alpha" : [0.001, true],
+  "gamma" : 0.99,
+  "buffer_size" : 1000000,
+  "epoch_size" : 10000,
+  "batch_size" : 256,
+  "polyak" : 0.995,
+  "lr" : 0.0001,
+  "reset_interval" : 200000,
+  "test_episodes" : 10,
+  "evaluation_ep" : 5,
+  "checkpoint_every" : 1000000,
+  "enable_restart" : false,
+  "log_folder" : "../../logs/gymnasium/off_policy/sac/CarGoal2/sac_r2",
+  "model_folder" : "../../output/gymnasium/off_policy/sac/CarGoal2/sac_r2"
+}
