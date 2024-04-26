@@ -241,9 +241,9 @@ class ConservativeSafetyCritic(object):
     def allocate_minibatches(self):
         """  Return minibatch indices  """
         indices = list(range(self.config.batch_size))
-        if self.config['minibatch_size'] > 0:
-            starts = list(range(0, len(indices), self.config['minibatch_size']))
-            stops = [item + self.config['minibatch_size'] for item in starts]
+        if self.config.minibatch_size > 0:
+            starts = list(range(0, len(indices), self.config.minibatch_size))
+            stops = [item + self.config.minibatch_size for item in starts]
             if stops[-1] != len(indices):
                 warn('Trajectory length is not a multiple of minibatch size; wasting data')
             stops[-1] = len(indices)
@@ -347,9 +347,10 @@ class ConservativeSafetyCritic(object):
         actions = self.pi_buffer.actions
         old_log_probs = torch.from_numpy(self.pi_buffer.log_probs.astype(float)).float()
         if not self.config.trpo:
+            kld_flag = False
             for i in range(self.config.train_pi_iter):
                 np.random.shuffle(self.mb.indices)
-                for start, stop in zip(self.mb.indices.starts, self.mb.indices.stops):
+                for start, stop in zip(self.mb.starts, self.mb.stops):
                     mb = self.mb.indices[start:stop]
                     self.pi_optimizer.zero_grad()
                     pi_loss, entropy, kld = self.compute_policy_loss(observations[mb], actions[mb],
@@ -359,6 +360,7 @@ class ConservativeSafetyCritic(object):
                     entropies.append(entropy.item())
                     mean_kld = mpi_avg(MPI.COMM_WORLD, kld)
                     if mean_kld > self.config.max_kl > 0:
+                        kld_flag = True
                         if self.id == 0:
                             print('Policy KL divergence exceeds limit; stopping update at step %d.' % i, flush=True)
                         break
@@ -367,6 +369,8 @@ class ConservativeSafetyCritic(object):
                     if self.id == 0:
                         self.pi_optimizer.step()
                     sync_weights(MPI.COMM_WORLD, self.pi_network.parameters())
+                if kld_flag:
+                    break
             return {'pi_losses': pi_losses, 'v_losses': v_losses,
                     'entropies': entropies, 'penalty': [self.penalty]}
         else:  # TRPO update; assuming we won't want minibatches for it
@@ -492,7 +496,7 @@ class ConservativeSafetyCritic(object):
                 qc_input = torch.cat((torch_bootstrap_obs, torch.from_numpy(actions).float()), dim=-1)
                 c_values = self.qc_network(qc_input).squeeze(-1).numpy()
                 bootstrap_values -= self.penalty * c_values
-            terminals = np.nonzero(self.pi_buffer.dones.astype(int))[0]
+            terminals = self.pi_buffer.dones[np.nonzero(self.pi_buffer.dones.astype(int))[0]].astype(int)
             self.pi_buffer.bootstraps = bootstrap_values * (terminals > 1)
 
     def estimate_advantages(self):
@@ -636,8 +640,8 @@ class ConservativeSafetyCritic(object):
             self.logger.log_mean_value('Train/rewards', rewards_to_log, steps)
             self.logger.log_mean_value('Train/costs', costs_to_log, steps)
             self.logger.log_mean_value('Train/lengths', lengths_to_log, steps)
-            self.pi_buffer.reset_logging()
             self.logger.flush()
+        self.pi_buffer.reset_logging()
 
     def save_training(self, total_steps, last_checkpoint):
         """  Save networks, as required.  Update last_checkpoint.  """
